@@ -192,7 +192,11 @@ def delete_iam_user(username, dry_run):
       3. Delete the user
     Returns True on success (or dry run).
     """
-    # 1. List access keys (always run, even in dry-run, so we can show what would be deleted)
+    if dry_run:
+        dim(f"    [dry-run] Would delete access keys, inline policies, and user: {username}")
+        return True
+
+    # 1. List + delete access keys
     ok_keys, keys_out = aws("iam", "list-access-keys", "--user-name", username)
     if not ok_keys:
         if "NoSuchEntity" in keys_out or "cannot be found" in keys_out:
@@ -207,17 +211,16 @@ def delete_iam_user(username, dry_run):
         key_ids = []
 
     for key_id in key_ids:
-        print(f"    {'[dry-run] ' if dry_run else ''}Deleting access key : {key_id}")
-        if not dry_run:
-            ok_del, del_out = aws("iam", "delete-access-key",
-                                  "--user-name", username, "--access-key-id", key_id)
-            if not ok_del:
-                err(f"    Failed to delete key {key_id}: {del_out}")
+        print(f"    Deleting access key : {key_id}")
+        ok_del, del_out = aws("iam", "delete-access-key",
+                              "--user-name", username, "--access-key-id", key_id)
+        if not ok_del:
+            err(f"    Failed to delete key {key_id}: {del_out}")
 
     if not key_ids:
         dim("    No access keys found.")
 
-    # 2. List inline policies
+    # 2. List + delete inline policies
     ok_pol, pol_out = aws("iam", "list-user-policies", "--user-name", username)
     try:
         policy_names = json.loads(pol_out).get("PolicyNames", []) if ok_pol else []
@@ -225,23 +228,21 @@ def delete_iam_user(username, dry_run):
         policy_names = []
 
     for policy_name in policy_names:
-        print(f"    {'[dry-run] ' if dry_run else ''}Deleting inline policy : {policy_name}")
-        if not dry_run:
-            ok_pdel, pdel_out = aws("iam", "delete-user-policy",
-                                    "--user-name", username, "--policy-name", policy_name)
-            if not ok_pdel:
-                err(f"    Failed to delete policy {policy_name}: {pdel_out}")
+        print(f"    Deleting inline policy : {policy_name}")
+        ok_pdel, pdel_out = aws("iam", "delete-user-policy",
+                                "--user-name", username, "--policy-name", policy_name)
+        if not ok_pdel:
+            err(f"    Failed to delete policy {policy_name}: {pdel_out}")
 
     if not policy_names:
         dim("    No inline policies found.")
 
     # 3. Delete user
-    print(f"    {'[dry-run] ' if dry_run else ''}Deleting IAM user : {username}")
-    if not dry_run:
-        ok_usr, usr_out = aws("iam", "delete-user", "--user-name", username)
-        if not ok_usr:
-            err(f"    Failed to delete user: {usr_out}")
-            return False
+    print(f"    Deleting IAM user : {username}")
+    ok_usr, usr_out = aws("iam", "delete-user", "--user-name", username)
+    if not ok_usr:
+        err(f"    Failed to delete user: {usr_out}")
+        return False
 
     return True
 
