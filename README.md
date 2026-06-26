@@ -10,7 +10,7 @@ Scans the Doppler workplace activity log for every credential action that person
 |---|---|---|
 | Dynamic AWS IAM users | Activity log — `Issued a lease` events | Delete access keys → inline policies → IAM user |
 | Service tokens | Activity log — `Created service token` events | List active tokens in those configs + interactive revocation |
-| High-entropy secrets | Fetch secrets from all accessed configs | Add rotate-me note via Doppler API |
+| High-entropy secrets | Fetch secrets from all accessed configs | List values likely to be API keys/tokens for manual rotation |
 
 ## Why this exists
 
@@ -27,7 +27,7 @@ This script gives you a complete, auditable list of every credential that person
 | **3 — Service tokens** | Finds configs where the user created service tokens, lists current active tokens, prompts to revoke each one |
 | **4 — Non-prod IAM** | Deletes dynamic IAM users from dev/staging environments automatically |
 | **5 — Prod IAM** | Lists prod IAM users, warns explicitly, requires y/n confirmation per credential |
-| **6 — Secret scan** | _(opt-in)_ Scans secrets in accessed configs for high-entropy values, lets you add rotate-me notes |
+| **6 — Secret scan** | _(opt-in)_ Scans secrets in accessed configs for high-entropy values and lists them for manual rotation |
 
 For each dynamic IAM user the script:
 1. Lists and deletes all access keys (immediate credential revocation)
@@ -36,17 +36,73 @@ For each dynamic IAM user the script:
 
 ## Prerequisites
 
-**Doppler**
-- A personal access token with **View All Logs** (`logs_audit`) permission
-- For service token revocation: also needs **Manage Service Tokens** on affected projects
-- For secret scanning: also needs **View Secrets** on affected projects
-- Generate one at: `https://dashboard.doppler.com/workplace/settings/tokens`
+### Doppler CLI
 
-**AWS**
-- `aws` CLI installed and configured
-- IAM permissions: `iam:ListAccessKeys`, `iam:DeleteAccessKey`, `iam:ListUserPolicies`, `iam:DeleteUserPolicy`, `iam:DeleteUser`
+Install the Doppler CLI to manage your token and authenticate:
 
-**Python**
+```bash
+# macOS
+brew install dopplerhq/cli/doppler
+
+# Linux
+curl -Ls https://cli.doppler.com/install.sh | sh
+
+# Windows (PowerShell)
+winget install Doppler.doppler
+```
+
+Verify the install:
+
+```bash
+doppler --version
+```
+
+**Personal access token**
+
+The script authenticates via a `DOPPLER_TOKEN` environment variable (not the CLI login session). Generate a personal access token at:
+
+```
+https://dashboard.doppler.com/workplace/settings/tokens
+```
+
+Required token permissions:
+- **View All Logs** (`logs_audit`) — always required
+- **Manage Service Tokens** on affected projects — for service token revocation
+- **View Secrets** on affected projects — for secret scanning (`--scan-secrets`)
+
+### AWS CLI
+
+Install the AWS CLI:
+
+```bash
+# macOS
+brew install awscli
+
+# Linux
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip && sudo ./aws/install
+
+# Windows
+winget install Amazon.AWSCLI
+```
+
+Configure credentials:
+
+```bash
+aws configure
+# or use a named profile:
+AWS_PROFILE=my-profile python3 offboard.py --user alice@example.com --delete
+```
+
+Required IAM permissions for the operator running this script:
+- `iam:ListAccessKeys`
+- `iam:DeleteAccessKey`
+- `iam:ListUserPolicies`
+- `iam:DeleteUserPolicy`
+- `iam:DeleteUser`
+
+### Python
+
 ```bash
 pip install requests
 ```
@@ -85,11 +141,9 @@ DOPPLER_TOKEN=dp.pt.xxx python3 offboard.py --user alice@example.com --since 202
 DOPPLER_TOKEN=dp.pt.xxx python3 offboard.py --user alice@example.com --scan-secrets
 ```
 
-For each config the user accessed, fetches secrets and flags values with high Shannon entropy (likely API keys, tokens, or random secrets). Lets you add a "rotate-me" note to each flagged secret via the Doppler API — the note will be visible in the Doppler dashboard on that secret.
+For each config the user accessed, fetches secrets and flags values with high Shannon entropy (likely API keys, tokens, or random secrets). Lists them so you can rotate them manually in the Doppler dashboard.
 
-> **Note:** Doppler secret notes are project-scoped (apply to a secret name across all configs in the project).
-
-> **No rotation API:** Doppler's "Rotate now" button has no public API equivalent. This tool flags secrets with a note as the next-best option — rotate them manually from the dashboard or CLI after offboarding.
+> **No rotation API:** Doppler's "Rotate now" button has no public API equivalent. Rotate flagged secrets manually from the dashboard or CLI after offboarding.
 
 ### 5. Skip or force prod
 
@@ -99,6 +153,12 @@ DOPPLER_TOKEN=dp.pt.xxx python3 offboard.py --user alice@example.com --delete --
 
 # Force delete everything including prod — no prompts (CI/automation)
 DOPPLER_TOKEN=dp.pt.xxx python3 offboard.py --user alice@example.com --delete --force-prod
+```
+
+### 6. Using a named AWS profile
+
+```bash
+AWS_PROFILE=prod-admin DOPPLER_TOKEN=dp.pt.xxx python3 offboard.py --user alice@example.com --delete
 ```
 
 ## Options
