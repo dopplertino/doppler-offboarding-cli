@@ -370,25 +370,6 @@ def is_high_entropy(value, threshold, min_length):
     return shannon_entropy(value) >= threshold
 
 
-def set_secret_note(token, project, config, secret_name, note, dry_run):
-    """
-    Set a note on a secret via POST /v3/configs/config/secrets/note.
-    Note: notes are project-scoped in Doppler (apply across all configs).
-    Returns True on success.
-    """
-    if dry_run:
-        dim(f"      [dry-run] Would add note to {secret_name} in {project}")
-        return True
-    try:
-        doppler_post(token, "/configs/config/secrets/note",
-                     {"project": project, "config": config,
-                      "secret": secret_name, "note": note})
-        return True
-    except requests.HTTPError as exc:
-        err(f"      Failed to set note on {secret_name}: {exc}")
-        return False
-
-
 # ── AWS IAM cleanup ───────────────────────────────────────────────────────────
 
 def aws_cmd(*args, capture=True):
@@ -581,8 +562,8 @@ def main():
     parser.add_argument(
         "--scan-secrets", action="store_true",
         help=(
-            "Scan secrets in configs the user accessed for high-entropy values "
-            "(likely API keys). Allows adding a rotate-me note via the Doppler API."
+            "Scan secrets in configs the user accessed and list any high-entropy "
+            "values (likely API keys / tokens) that should be manually rotated."
         ),
     )
     parser.add_argument(
@@ -652,9 +633,9 @@ def main():
         log(f"Log pages      : {args.max_pages if args.max_pages else 'all available'}")
     log(f"Secret scan    : "
         + (f"enabled  (entropy >= {args.entropy_threshold} bits/char, "
-           f"length >= {args.min_secret_length})"
+           f"min length {args.min_secret_length})"
            if args.scan_secrets else
-           "disabled  (use --scan-secrets to enable)"))
+           "disabled  (--scan-secrets to list secrets needing rotation)"))
     print()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -955,26 +936,26 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # Phase 6 — High-entropy secret scan
     # ══════════════════════════════════════════════════════════════════════════
-    section("Phase 6 — High-entropy secret scan")
+    section("Phase 6 — Secrets requiring manual rotation")
 
-    notes_set    = 0
-    notes_skip   = 0
-    no_access_ct = 0
+    total_flagged = 0
+    no_access_ct  = 0
 
     if not args.scan_secrets:
         dim("  Skipped. Use --scan-secrets to enable.")
-        dim("  Scans secrets in all configs the user accessed, flags high-entropy")
-        dim("  values that are likely API keys, and lets you add a rotate-me note")
-        dim("  via the Doppler API so they appear flagged in the dashboard.")
+        dim("  Fetches secrets from every config the user accessed and lists")
+        dim("  any high-entropy values (likely API keys / tokens) that should")
+        dim("  be manually rotated now that this user has been offboarded.")
         print()
     elif not access_report:
         dim("  No accessed configs to scan.")
         print()
     else:
-        # Unique (project, config) pairs from the access report
+        # Unique (project, config) pairs, sorted prod-first
         seen_configs = set()
         configs_to_scan = []
-        for meta in access_report.values():
+        for meta in sorted(access_report.values(),
+                           key=lambda m: (not m["is_prod"], m["project"], m["config"])):
             p = meta["project"]
             c = meta["config"]
             if c and c != "unknown" and (p, c) not in seen_configs:
@@ -985,11 +966,6 @@ def main():
             f"(entropy >= {args.entropy_threshold} bits/char, "
             f"length >= {args.min_secret_length})")
         print()
-
-        rotate_note = (
-            f"ROTATE REQUIRED — accessible to {args.user} who has been offboarded. "
-            "Note added by offboard.py. Replace this value and remove this note when done."
-        )
 
         for project, config, is_prod in configs_to_scan:
             secrets = fetch_secrets(token, project, config)
@@ -1011,54 +987,33 @@ def main():
             if not flagged:
                 continue
 
+            total_flagged += len(flagged)
             env_colour = C.RED if is_prod else C.CYAN
             print(f"  {env_colour}{C.BOLD}{'[PROD] ' if is_prod else ''}"
                   f"{project} / {config}{C.RESET}")
-            if is_prod:
-                print(f"  {C.RED}WARNING: These are production secrets.{C.RESET}")
-            print(f"  {len(flagged)} high-entropy secret(s) detected:\n")
+            print(f"  {C.YELLOW}Rotate these secrets manually in the Doppler dashboard.{C.RESET}")
+            print(f"  {C.YELLOW}Set a reminder on each so owners are notified.{C.RESET}")
+            print()
 
             for name, val in sorted(flagged.items()):
                 entropy = shannon_entropy(val)
-                masked  = (val[:6] + "..." + val[-4:]
-                           if len(val) > 14 else "***")
-                print(f"    {C.BOLD}{name}{C.RESET}")
-                print(f"      Length  : {len(val)} chars  |  "
-                      f"Entropy : {entropy:.2f} bits/char")
+                masked  = (val[:6] + "..." + val[-4:] if len(val) > 14 else "***")
+                prod_tag = f" {C.RED}[PROD]{C.RESET}" if is_prod else ""
+                print(f"    {C.BOLD}{name}{C.RESET}{prod_tag}")
+                print(f"      Length  : {len(val)} chars")
+                print(f"      Entropy : {entropy:.2f} bits/char")
                 print(f"      Preview : {C.DIM}{masked}{C.RESET}")
                 print()
-
-                if dry_run:
-                    dim(f"      [dry-run] Would prompt: add rotate-me note to {name}?")
-                    continue
-
-                try:
-                    do_note = prompt_yn(
-                        f"Add rotate-me note to {C.BOLD}{name}{C.RESET} "
-                        f"in project {project}?"
-                    )
-                except KeyboardInterrupt:
-                    warn("  Aborted.")
-                    break
-
-                if do_note:
-                    if set_secret_note(token, project, config, name,
-                                       rotate_note, dry_run=False):
-                        ok(f"      Note set on {name}. "
-                           f"{C.DIM}(Notes are project-scoped — "
-                           f"visible in all configs){C.RESET}")
-                        notes_set += 1
-                    else:
-                        notes_skip += 1
-                else:
-                    warn(f"      Skipped {name}.")
-                    notes_skip += 1
             print()
 
-        if not dry_run:
-            log(f"Secret notes — set: {notes_set}  "
-                f"skipped: {notes_skip}  "
-                f"configs with no access: {no_access_ct}")
+        if no_access_ct:
+            dim(f"  {no_access_ct} config(s) skipped — token lacks read access.")
+        if total_flagged:
+            print(f"  {C.YELLOW}{C.BOLD}Action required:{C.RESET} "
+                  f"{total_flagged} secret(s) listed above should be rotated.")
+            print(f"  {C.DIM}Dashboard: project → config → secret → clock icon → set reminder{C.RESET}")
+        else:
+            ok("  No high-entropy secrets found in accessible configs.")
         print()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1086,9 +1041,9 @@ def main():
         print(f"  Prod failures                : {p_failed}")
     if args.scan_secrets:
         print()
-        print(f"  Rotate-me notes set          : {notes_set}")
-        if notes_skip:
-            print(f"  Secrets skipped              : {notes_skip}")
+        print(f"  Secrets flagged for rotation : {total_flagged}")
+        if no_access_ct:
+            print(f"  Configs with no read access  : {no_access_ct}")
 
     if dry_run:
         print()
