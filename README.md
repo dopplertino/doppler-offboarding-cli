@@ -14,9 +14,15 @@ Scans the Doppler workplace activity log for every credential action that person
 
 ## Why this exists
 
-Doppler's dynamic secrets automatically expire (default TTL: 30 minutes), but if Doppler's cleanup job fails, the IAM user can be orphaned in AWS — indefinitely active even though the lease is gone. Service tokens have no expiry unless explicitly revoked. During offboarding you want certainty, not reliance on eventual cleanup.
+Removing a user from Doppler revokes their login — but it doesn't close every hole they leave behind.
 
-This script gives you a complete, auditable list of every credential that person created, and handles them through a phased workflow that protects production environments.
+A person who had access to your secrets may have:
+- **Remembered or copied secret values** they fetched during their time at the company
+- **Created service tokens** that continue to authenticate as long as they exist — with no expiry
+- **Issued dynamic AWS credentials** whose IAM users can be orphaned in AWS even after the Doppler lease expires, remaining active indefinitely
+- **Had read access to high-entropy secrets** (API keys, tokens, signing secrets) that now need to be rotated
+
+Standard offboarding removes the person. This tool helps you understand and address the secrets exposure they leave behind: what they accessed, what they created, what's still live, and what needs to be rotated. It works through a phased workflow that separates non-prod cleanup (automatic) from prod changes (explicit confirmation), so you can move fast without breaking production.
 
 ## How it works
 
