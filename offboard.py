@@ -33,6 +33,7 @@ Requirements:
 """
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -58,6 +59,10 @@ PROD_ENV_NAMES = {"prd", "prod", "production", "live", "release"}
 # Defaults for the high-entropy secret scanner
 DEFAULT_ENTROPY_THRESHOLD = 3.5   # bits/char  (random hex ≈ 4.0, base64 ≈ 6.0)
 DEFAULT_MIN_SECRET_LENGTH = 24    # characters
+
+# Parallel log fetching
+_LOG_FETCH_WORKERS     = 5   # concurrent page requests per batch
+_LOG_FETCH_MAX_RETRIES = 5   # per-page retry limit on 429
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -125,51 +130,109 @@ def doppler_delete(token, path, body=None):
     return resp.json()
 
 
-def fetch_all_logs(token, max_pages, since=None):
+def _fetch_log_page(token, page, per_page):
     """
-    Paginate GET /v3/logs (newest-first).
-    Stops early when max_pages is reached or all entries are older than `since`.
+    Fetch one page of logs with 429-aware retry / exponential backoff.
+    Returns the list of log entries for that page.
+    Raises on persistent failure.
     """
-    all_logs = []
-    page = 1
-    per_page = 20
-    while True:
-        if max_pages and page > max_pages:
-            warn(f"Reached --max-pages limit ({max_pages}). Stopping scan early.")
-            break
+    delay = 1.0
+    for attempt in range(_LOG_FETCH_MAX_RETRIES):
         try:
             data = doppler_get(token, "/logs", {"page": page, "per_page": per_page})
+            return data.get("logs", [])
         except requests.HTTPError as exc:
-            err(f"Failed to fetch logs page {page}: {exc}")
-            break
-        entries = data.get("logs", [])
-        if not entries:
-            break
+            if exc.response is not None and exc.response.status_code == 429:
+                retry_after = exc.response.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else delay
+                warn(f"Rate limited on page {page} — waiting {wait:.0f}s "
+                     f"(retry {attempt + 1}/{_LOG_FETCH_MAX_RETRIES})")
+                time.sleep(wait)
+                delay = min(delay * 2, 60)
+            else:
+                raise
+    raise RuntimeError(
+        f"Gave up fetching page {page} after {_LOG_FETCH_MAX_RETRIES} retries"
+    )
 
-        if since is not None:
-            filtered = []
-            hit_cutoff = False
-            for e in entries:
-                try:
-                    dt = datetime.fromisoformat(
-                        (e.get("created_at") or "").replace("Z", "+00:00")
-                    )
-                    if dt < since:
-                        hit_cutoff = True
-                        continue
-                except Exception:
-                    pass
-                filtered.append(e)
-            all_logs.extend(filtered)
-            if hit_cutoff:
+
+def fetch_all_logs(token, max_pages, since=None):
+    """
+    Paginate GET /v3/logs (newest-first), fetching up to _LOG_FETCH_WORKERS
+    pages concurrently per batch. Each page retries on 429 with backoff.
+    Stops early when max_pages is reached or entries are older than `since`.
+    """
+    all_logs = []
+    per_page = 20
+    next_page = 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_LOG_FETCH_WORKERS) as pool:
+        while True:
+            # Stop if we've already consumed all allowed pages
+            if max_pages and next_page > max_pages:
+                warn(f"Reached --max-pages limit ({max_pages}). Stopping scan early.")
                 break
-        else:
-            all_logs.extend(entries)
 
-        if len(entries) < per_page:
-            break
-        page += 1
-        time.sleep(0.1)
+            # Build page batch, capped at max_pages
+            end_page = next_page + _LOG_FETCH_WORKERS
+            if max_pages:
+                end_page = min(end_page, max_pages + 1)
+            batch = list(range(next_page, end_page))
+
+            # Submit all pages in the batch concurrently
+            futures = {
+                pool.submit(_fetch_log_page, token, p, per_page): p
+                for p in batch
+            }
+
+            # Collect results, preserving per-page association
+            results = {}
+            for fut in concurrent.futures.as_completed(futures):
+                p = futures[fut]
+                try:
+                    results[p] = fut.result()
+                except Exception as exc:
+                    err(f"Failed to fetch logs page {p}: {exc}")
+                    results[p] = None   # treat as terminal
+
+            # Process pages in ascending order to honour newest-first semantics
+            # and correctly detect the last page / since cutoff
+            done = False
+            for p in sorted(results):
+                entries = results[p]
+                if not entries:          # None (error) or empty list → end of data
+                    done = True
+                    break
+
+                if since is not None:
+                    keep = []
+                    hit_cutoff = False
+                    for e in entries:
+                        try:
+                            dt = datetime.fromisoformat(
+                                (e.get("created_at") or "").replace("Z", "+00:00")
+                            )
+                            if dt < since:
+                                hit_cutoff = True
+                                continue
+                        except Exception:
+                            pass
+                        keep.append(e)
+                    all_logs.extend(keep)
+                    if hit_cutoff:
+                        done = True
+                        break
+                else:
+                    all_logs.extend(entries)
+
+                if len(entries) < per_page:   # short page → last page reached
+                    done = True
+                    break
+
+            next_page += len(batch)
+
+            if done:
+                break
 
     return all_logs
 
